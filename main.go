@@ -27,7 +27,8 @@ type card struct {
 	cancel context.CancelFunc
 
 	cellsW, cellsH int
-	started        bool
+
+	hidden atomic.Bool // the card's panel is closed: render nothing until it shows again
 
 	paused   atomic.Bool
 	overlay  atomic.Bool
@@ -36,12 +37,15 @@ type card struct {
 	answered chan uint64 // the seq of each frame AutoDoc answered, for the paced loop
 	wake     chan struct{}
 
-	mu      sync.Mutex
-	info    plugin.SurfaceInfo
-	format  string
-	lines   []string // the overlay's text, the latest second's
-	history []float64
-	stats   *stats
+	mu       sync.Mutex
+	running  bool          // a render loop is running
+	done     chan struct{} // closed when that loop has ended and freed its renderer
+	measured bool          // the measure loop started (it runs until Close)
+	info     plugin.SurfaceInfo
+	format   string
+	lines    []string // the overlay's text, the latest second's
+	history  []float64
+	stats    *stats
 }
 
 func newCard() *card {
@@ -50,7 +54,15 @@ func newCard() *card {
 	return c
 }
 
+// logf writes to the plugin's log (its stderr, kept by AutoDoc in
+// ~/.local/state/autodoc/plugins/render-test.log): the lifecycle, to tell a plugin that never got
+// a surface from one that stopped drawing.
+func logf(format string, a ...any) {
+	fmt.Fprintf(os.Stderr, "%s render-test: "+format+"\n", append([]any{time.Now().Format("15:04:05.000")}, a...)...)
+}
+
 func (c *card) Open(p *plugin.Peer, o plugin.Open) {
+	logf("open: %dx%d cells, pid %d, host pid %d", o.Width, o.Height, os.Getpid(), os.Getppid())
 	c.peer, c.cellsW, c.cellsH = p, o.Width, o.Height
 	c.ctx, c.cancel = context.WithCancel(context.Background())
 	c.drawCells()
@@ -92,16 +104,54 @@ func (c *card) poke() {
 	}
 }
 
+// Surface is each generation of the surface: the first after Open, then each resize, scale or caps
+// change, and the one AutoDoc sends when the card shows again. It (re)starts the render loop when
+// none runs: a loop that ended (the side channel closed under it) would otherwise leave the card
+// blank for good.
 func (c *card) Surface(sf *plugin.Surface, info plugin.SurfaceInfo) {
+	w, h := info.Pixels()
+	kinds := make([]string, len(info.Kinds))
+	for i, k := range info.Kinds {
+		kinds[i] = k.Kind + "/" + k.Format
+	}
+	logf("surface: gen %d, %.0fx%.0f dp at %.2f (%dx%d px), kinds %v", info.Gen, info.W, info.H, info.Scale, w, h, kinds)
 	c.mu.Lock()
 	c.info = info
-	start := !c.started
-	c.started = true
+	start := !c.running && c.ctx.Err() == nil
+	if start {
+		c.running, c.done = true, make(chan struct{})
+	}
+	measure := !c.measured
+	c.measured = true
+	done := c.done
 	c.mu.Unlock()
 	if start {
-		go c.render(sf)
+		go func() {
+			defer close(done)
+			c.render(sf)
+			c.mu.Lock()
+			c.running = false
+			c.mu.Unlock()
+		}()
+	}
+	if measure {
 		go c.measure(sf)
 	}
+	c.poke()
+}
+
+// Hide is the card's panel closed (Esc, or its close): the plugin keeps running, so it stops
+// drawing until Show, and AutoDoc has nothing to upload meanwhile.
+func (c *card) Hide() {
+	logf("hide")
+	c.hidden.Store(true)
+}
+
+// Show is the card's panel open again.
+func (c *card) Show() {
+	logf("show")
+	c.hidden.Store(false)
+	c.poke()
 }
 
 // SurfacePointer is the pointer on the surface. The card takes no pointer input of its own (its
@@ -112,9 +162,32 @@ func (c *card) SurfacePointer(plugin.SurfacePointer) {}
 // the SDK hands a surface only to a plugin.SurfaceHandler: this fails to compile without one
 var _ plugin.SurfaceHandler = (*card)(nil)
 
+// and Hide/Show only to a plugin.Hider
+var _ plugin.Hider = (*card)(nil)
+
+// Close is the plugin turned off, removed or updated, or AutoDoc quitting: the render loop stops,
+// and the renderer (the Vulkan device and its buffers) is freed before Close returns, so the next
+// start finds the GPU as this one found it.
 func (c *card) Close() {
+	reason := ""
+	if c.peer != nil {
+		reason = c.peer.CloseReason()
+	}
+	logf("close (%s)", reason)
 	if c.cancel != nil {
 		c.cancel()
+	}
+	c.mu.Lock()
+	done := c.done
+	c.mu.Unlock()
+	if done == nil {
+		return
+	}
+	select {
+	case <-done:
+		logf("closed: the render loop ended and freed its renderer")
+	case <-time.After(2 * time.Second):
+		logf("closed: the render loop did not end within 2 s")
 	}
 }
 
@@ -136,12 +209,25 @@ func open(want string) (r scene.Renderer, device, note string) {
 // frame saying so, then waits.
 func (c *card) render(sf *plugin.Surface) {
 	r, device, note := open("vulkan")
-	defer func() { r.Close() }()
+	defer func() {
+		r.Close()
+		logf("render loop ended; %s renderer freed", r.Name())
+	}()
 	c.stats.setRenderer(r.Name(), device, note)
+	logf("render loop started: %s %s %s", r.Name(), device, note)
 	var sceneT time.Duration // the scene's clock, which stands still while paused
 	last := time.Now()
 	shownPaused := false
 	for {
+		if c.hidden.Load() {
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-c.wake:
+			}
+			last = time.Now()
+			continue
+		}
 		paused := c.paused.Load()
 		if paused && shownPaused {
 			select {
@@ -163,6 +249,9 @@ func (c *card) render(sf *plugin.Surface) {
 		}
 		b, err := sf.Buffer(c.ctx)
 		if err != nil {
+			if c.ctx.Err() == nil {
+				logf("render loop: no buffer: %v", err)
+			}
 			return
 		}
 		now := time.Now()
@@ -176,6 +265,7 @@ func (c *card) render(sf *plugin.Surface) {
 			r.Close()
 			r, device, _ = open("cpu")
 			c.stats.setRenderer(r.Name(), device, "fell back to the CPU: "+err.Error())
+			logf("vulkan failed, on the CPU now: %v", err)
 			if err := r.Draw(sceneT.Seconds(), b.Pix, b.W, b.H, b.Pitch, bgra); err != nil {
 				return
 			}
@@ -190,6 +280,7 @@ func (c *card) render(sf *plugin.Surface) {
 		}
 		seq, err := sf.Present(b, image.Rectangle{}, 0)
 		if err != nil {
+			logf("render loop: present: %v", err)
 			return
 		}
 		c.stats.presented(seq, time.Now())
