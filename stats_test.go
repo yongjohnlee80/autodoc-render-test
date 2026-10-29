@@ -32,7 +32,7 @@ func TestDoneMeasuresLatencyAndInterval(t *testing.T) {
 	if len(s.presentAt) != 0 {
 		t.Fatalf("presentAt keeps %v after every outcome", s.presentAt)
 	}
-	lines, history := s.second(plugin.SurfaceInfo{W: 100, H: 50, Scale: 2}, "bgra8")
+	lines, history := s.second(plugin.SurfaceInfo{W: 100, H: 50, Scale: 2}, "bgra8", true)
 	if len(history) != 1 || !strings.Contains(strings.Join(lines, "\n"), "shown 2 fps   superseded 1") {
 		t.Fatalf("second = %q, %v", lines, history)
 	}
