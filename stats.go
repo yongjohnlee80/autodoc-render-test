@@ -36,6 +36,7 @@ type stats struct {
 	lastDrawn  int64
 	history    []float64 // the latest historyLen intervals
 	lastCPU    uint64    // the host's utime+stime, in clock ticks, at the last second
+	lastSelf   uint64    // the plugin's own, likewise
 	lastSecond time.Time
 }
 
@@ -96,7 +97,7 @@ func (s *stats) done(d plugin.SurfaceFrameDone) {
 }
 
 // second closes the second: the overlay's lines and the interval history, and the counts reset.
-func (s *stats) second(info plugin.SurfaceInfo, format string) ([]string, []float64) {
+func (s *stats) second(info plugin.SurfaceInfo, format string, paced bool) ([]string, []float64) {
 	s.mu.Lock()
 	renders, latency, interval := s.renders, s.latency, s.interval
 	outcomes := s.outcomes
@@ -113,8 +114,12 @@ func (s *stats) second(info plugin.SurfaceInfo, format string) ([]string, []floa
 	if device != "" {
 		name += " (" + device + ")"
 	}
+	pacing := "unpaced"
+	if paced {
+		pacing = "paced"
+	}
 	lines := []string{
-		fmt.Sprintf("renderer %s   surface %dx%d px @%.2f %s", name, w, h, info.Scale, format),
+		fmt.Sprintf("renderer %s   %s   surface %dx%d px @%.2f %s", name, pacing, w, h, info.Scale, format),
 		fmt.Sprintf("shown %d fps   superseded %d   not shown %d   rendered %d/s",
 			outcomes["drawn"], outcomes["superseded"], outcomes["not_shown"], len(renders)),
 		fmt.Sprintf("frame time (shown) p50 %s  p95 %s  max %s   budget %.1f ms",
@@ -122,12 +127,12 @@ func (s *stats) second(info plugin.SurfaceInfo, format string) ([]string, []floa
 		fmt.Sprintf("render p50 %s  p95 %s   present->shown p50 %s  p95 %s",
 			ms(pct(durMS(renders), 50)), ms(pct(durMS(renders), 95)), ms(pct(latency, 50)), ms(pct(latency, 95))),
 		s.hostLine(elapsed),
-		selfLine(),
+		s.selfLine(elapsed),
 	}
 	if note != "" {
 		lines = append(lines, "note: "+note)
 	}
-	lines = append(lines, "keys: r renderer   space pause   o overlay")
+	lines = append(lines, "keys: r renderer   u paced/unpaced   space pause   o overlay")
 	return lines, history
 }
 
@@ -152,13 +157,23 @@ var heapSamples = []metrics.Sample{
 	{Name: "/gc/cycles/total:gc-cycles"},
 }
 
-// selfLine is the plugin's own memory.
-func selfLine() string {
+// selfLine is the plugin's own CPU and memory: where the two renderers differ most, since the CPU
+// one draws on every core and the Vulkan one mostly waits on the GPU.
+func (s *stats) selfLine(elapsed float64) string {
 	metrics.Read(heapSamples)
 	heap := heapSamples[0].Value.Uint64()
 	gcs := heapSamples[1].Value.Uint64()
 	st := procStatus(os.Getpid())
-	return fmt.Sprintf("plugin: RSS %s   Go heap %.1f MB   GC %d", kb(st["VmRSS"]), float64(heap)/(1<<20), gcs)
+	cpu := ""
+	if ticks, ok := procCPU(os.Getpid()); ok {
+		s.mu.Lock()
+		if s.lastSelf != 0 && elapsed > 0 {
+			cpu = fmt.Sprintf("CPU %.0f%%   ", float64(ticks-s.lastSelf)/clockTicks/elapsed*100)
+		}
+		s.lastSelf = ticks
+		s.mu.Unlock()
+	}
+	return fmt.Sprintf("plugin: %sRSS %s   Go heap %.1f MB   GC %d", cpu, kb(st["VmRSS"]), float64(heap)/(1<<20), gcs)
 }
 
 // clockTicks is USER_HZ, 100 on Linux.
