@@ -99,6 +99,14 @@ func (c *card) Surface(sf *plugin.Surface, info plugin.SurfaceInfo) {
 	}
 }
 
+// SurfacePointer is the pointer on the surface. The card takes no pointer input of its own (its
+// keys are r, space and o); the method is what makes the card a plugin.SurfaceHandler, without
+// which the SDK never calls Surface and the card stays on its line of text.
+func (c *card) SurfacePointer(plugin.SurfacePointer) {}
+
+// the SDK hands a surface only to a plugin.SurfaceHandler: this fails to compile without one
+var _ plugin.SurfaceHandler = (*card)(nil)
+
 func (c *card) Close() {
 	if c.cancel != nil {
 		c.cancel()
