@@ -1,0 +1,5 @@
+autodoc-render-test
+
+The 3D scene, its CPU rasterizer, its Vulkan renderer (scene/vulkan_linux.c, .h) and its shaders
+(scene/shaders) are adapted from golib's gui/examples/scene3d
+(https://github.com/yongjohnlee80/golib), Apache License 2.0, by the same author.
