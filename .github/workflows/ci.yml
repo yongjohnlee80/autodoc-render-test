@@ -1,0 +1,27 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Vulkan headers and loader (the Vulkan renderer is cgo)
+        run: sudo apt-get update && sudo apt-get install -y libvulkan-dev
+      - name: gofmt
+        run: test -z "$(gofmt -l .)" || { gofmt -l .; exit 1; }
+      - run: go vet ./...
+      - run: go build -trimpath -o bin/autodoc-render-test .
+      - run: go test -race -count=1 ./...
+      - name: build without cgo (the CPU renderer only)
+        run: CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -o /dev/null .

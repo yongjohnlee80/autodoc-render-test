@@ -1,0 +1,21 @@
+# Render test, as an AutoDoc plugin. AutoDoc's Plugins › Add from a git URL… clones this
+# repository, asks before it runs anything, then runs [install] build here and starts `command`
+# from this directory.
+name     = "render-test"
+title    = "Render test (3D)"
+kind     = "dialog"
+protocol = 10                      # a pixel surface
+command  = ["./bin/autodoc-render-test"]
+
+[dialog]
+modal      = false                 # a card: docked beside the page, moved and resized as any panel
+width      = 100
+placements = ["right", "left"]
+
+[surface]
+required     = false               # the terminal shows a line saying to open it in the GUI
+context_menu = "host"              # a right press opens the card's own menu
+text_input   = false               # keys only: r, space, o
+
+[install]
+build = ["go", "build", "-trimpath", "-o", "bin/autodoc-render-test", "."]
