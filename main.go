@@ -2,8 +2,9 @@
 // pixel surface (protocol 10) shows golib's scene3d, drawn by the CPU or on the GPU with Vulkan,
 // with the frame rate, frame times and memory drawn over it, updated once a second.
 //
-// Keys, while the card has them: r switches the renderer, space pauses and resumes rendering
-// (to watch AutoDoc idle), o hides or shows the overlay.
+// Keys, while the card has them: r switches the renderer, u switches between paced (the next frame
+// once AutoDoc showed the last) and unpaced (as fast as AutoDoc credits buffers), space pauses and
+// resumes rendering (to watch AutoDoc idle), o hides or shows the overlay.
 package main
 
 import (
@@ -31,6 +32,8 @@ type card struct {
 	paused   atomic.Bool
 	overlay  atomic.Bool
 	switchTo atomic.Bool // the render loop switches renderer before its next frame
+	unpaced  atomic.Bool
+	answered chan uint64 // the seq of each frame AutoDoc answered, for the paced loop
 	wake     chan struct{}
 
 	mu      sync.Mutex
@@ -42,7 +45,7 @@ type card struct {
 }
 
 func newCard() *card {
-	c := &card{wake: make(chan struct{}, 1), stats: newStats(os.Getppid())}
+	c := &card{wake: make(chan struct{}, 1), answered: make(chan uint64, 64), stats: newStats(os.Getppid())}
 	c.overlay.Store(true)
 	return c
 }
@@ -77,6 +80,8 @@ func (c *card) Key(k plugin.Key) {
 		}
 	case "o":
 		c.overlay.Store(!c.overlay.Load())
+	case "u":
+		c.unpaced.Store(!c.unpaced.Load())
 	}
 }
 
@@ -189,6 +194,29 @@ func (c *card) render(sf *plugin.Surface) {
 		}
 		c.stats.presented(seq, time.Now())
 		shownPaused = paused
+		if !c.unpaced.Load() {
+			c.awaitAnswer(seq)
+		}
+	}
+}
+
+// awaitAnswer waits, paced, until AutoDoc answered frame seq (drawn, superseded or not shown), so
+// the next frame is drawn for the next refresh rather than thrown away. Done is lossy, so it gives
+// up after a few refreshes rather than stall.
+func (c *card) awaitAnswer(seq uint64) {
+	timeout := time.NewTimer(100 * time.Millisecond)
+	defer timeout.Stop()
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-timeout.C:
+			return
+		case got := <-c.answered:
+			if got >= seq {
+				return
+			}
+		}
 	}
 }
 
@@ -202,11 +230,15 @@ func (c *card) measure(sf *plugin.Surface) {
 			return
 		case d := <-sf.Done():
 			c.stats.done(d)
+			select {
+			case c.answered <- d.Seq:
+			default: // the render loop isn't waiting (unpaced): drop it
+			}
 		case <-tick.C:
 			c.mu.Lock()
 			info, format := c.info, c.format
 			c.mu.Unlock()
-			lines, history := c.stats.second(info, format)
+			lines, history := c.stats.second(info, format, !c.unpaced.Load())
 			c.mu.Lock()
 			c.lines, c.history = lines, history
 			c.mu.Unlock()

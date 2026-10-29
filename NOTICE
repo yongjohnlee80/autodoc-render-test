@@ -3,3 +3,7 @@ autodoc-render-test
 The 3D scene, its CPU rasterizer, its Vulkan renderer (scene/vulkan_linux.c, .h) and its shaders
 (scene/shaders) are adapted from golib's gui/examples/scene3d
 (https://github.com/yongjohnlee80/golib), Apache License 2.0, by the same author.
+
+Changed from the original: the Vulkan read-back target renders into an OPTIMAL image in device
+memory and is copied into a cached host buffer (vkCmdCopyImageToBuffer), where the original
+rendered straight into a LINEAR image in host-coherent memory, which loses the device on NVIDIA.
