@@ -1,6 +1,6 @@
 // Package scene is golib's gui/examples/scene3d made into a renderer a plugin draws with: a crate
 // over a tiled floor, textured and lit, drawn by the CPU or on the GPU with Vulkan, into a
-// buffer the caller owns (AutoDoc's shared memory). The scene, the CPU rasterizer and the Vulkan
+// buffer the caller owns (AutoDoc's shared memory), or on the GPU into images it exports. The scene, the CPU rasterizer and the Vulkan
 // C code are copied from that example (Apache-2.0, the same author); keep them in step with it.
 package scene
 
@@ -12,6 +12,26 @@ type Renderer interface {
 	Name() string
 	Draw(t float64, dst []byte, w, h, pitch int, bgra bool) error
 	Close()
+}
+
+// Exporter is a renderer that can also draw into images of its own which it exports as
+// DMA-BUFs, for AutoDoc to show with no copy.
+type Exporter interface {
+	Renderer
+	// NewTarget makes a w by h image, BGRA when bgra is set, exported with the LINEAR modifier in
+	// one plane: what AutoDoc admits. An error when the device exports none such.
+	NewTarget(w, h int, bgra bool) (Target, error)
+}
+
+// Target is an exported image. FD is its DMA-BUF, the target's own: it closes with Free. The one
+// plane starts at the object's first byte, Pitch bytes a row.
+type Target interface {
+	FD() int
+	Pitch() int
+	// Render draws the scene at time t into the image and waits for the GPU: the pixels are
+	// complete when it returns.
+	Render(t float64) error
+	Free()
 }
 
 func imagePt(w, h int) image.Point { return image.Pt(w, h) }

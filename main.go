@@ -9,9 +9,11 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"image"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -34,6 +36,7 @@ type card struct {
 	overlay  atomic.Bool
 	switchTo atomic.Bool // the render loop switches renderer before its next frame
 	unpaced  atomic.Bool
+	zeroCopy atomic.Bool // the frames are the GPU's own images: nothing is drawn over them
 	answered chan uint64 // the seq of each frame AutoDoc answered, for the paced loop
 	wake     chan struct{}
 
@@ -46,6 +49,7 @@ type card struct {
 	lines    []string // the overlay's text, the latest second's
 	history  []float64
 	stats    *stats
+	titled   bool // measure's own: the title carries the figures
 }
 
 func newCard() *card {
@@ -191,10 +195,20 @@ func (c *card) Close() {
 	}
 }
 
-// open is the renderer to use: Vulkan when want is "vulkan" and a device takes it, else the CPU.
-// The note says why a Vulkan request fell back.
-func open(want string) (r scene.Renderer, device, note string) {
-	if want == "vulkan" {
+// The renderers r cycles through. Zero-copy is Vulkan drawing into images it exports as DMA-BUFs,
+// registered with AutoDoc and presented as they are; copied is Vulkan read back into AutoDoc's
+// shared memory; the CPU draws straight into that memory.
+const (
+	modeZeroCopy = iota
+	modeCopied
+	modeCPU
+	modes
+)
+
+// open is the renderer for mode: Vulkan when a device takes it, else the CPU. The note says why
+// a Vulkan request fell back.
+func open(mode int) (r scene.Renderer, device, note string) {
+	if mode != modeCPU {
 		v, err := scene.NewVulkan()
 		if err == nil {
 			return v, v.Device(), ""
@@ -204,14 +218,74 @@ func open(want string) (r scene.Renderer, device, note string) {
 	return scene.NewCPU(), "", note
 }
 
+// exported is a generation's images, registered with AutoDoc: each by the id AutoDoc knows it by.
+type exported struct {
+	gen     int
+	targets map[int]scene.Target
+}
+
+func (e *exported) free() {
+	if e == nil {
+		return
+	}
+	for _, t := range e.targets {
+		t.Free()
+	}
+}
+
+// export makes up to three images for the surface's current generation and registers each with
+// AutoDoc. With none registered it says why: the window offers no DMA-BUF frames, the device
+// exports none AutoDoc admits, or AutoDoc refused them.
+func (c *card) export(sf *plugin.Surface, ex scene.Exporter) (*exported, string) {
+	info := sf.Info()
+	w, h := info.Pixels()
+	format := ""
+	for _, k := range info.Kinds {
+		if k.Kind == "dmabuf" && k.Modifier == 0 && (k.MaxW == 0 || w <= k.MaxW) && (k.MaxH == 0 || h <= k.MaxH) {
+			format = k.Format
+			break
+		}
+	}
+	if format == "" {
+		return nil, "the window offers no DMA-BUF frames at this size: copying"
+	}
+	e := &exported{gen: info.Gen, targets: map[int]scene.Target{}}
+	why := ""
+	for range plugin.MaxAddedBuffers {
+		t, err := ex.NewTarget(w, h, format == "bgra8")
+		if err != nil {
+			why = err.Error()
+			break
+		}
+		b, err := sf.AddBuffer(c.ctx, plugin.SurfaceDMABuf{FD: t.FD(), Gen: info.Gen, W: w, H: h, Pitch: t.Pitch(), Format: format})
+		if err != nil {
+			t.Free()
+			why = err.Error()
+			break
+		}
+		e.targets[b.ID] = t
+	}
+	if len(e.targets) == 0 {
+		return nil, why + ": copying"
+	}
+	c.mu.Lock()
+	c.format = format
+	c.mu.Unlock()
+	return e, ""
+}
+
 // render draws a frame into each buffer the host credits, as fast as it credits them: one frame
 // in flight per buffer, so the rate it reaches is what AutoDoc draws. Paused, it draws one last
 // frame saying so, then waits.
 func (c *card) render(sf *plugin.Surface) {
-	r, device, note := open("vulkan")
+	mode := modeZeroCopy
+	r, device, note := open(mode)
+	var zero *exported // the generation's registered images, in zero-copy mode
+	copyGen := -1      // the generation zero-copy was given up for: retried at the next
 	defer func() {
+		zero.free()
 		r.Close()
-		logf("render loop ended; %s renderer freed", r.Name())
+		logf("render loop ended; %s renderer and its images freed", r.Name())
 	}()
 	c.stats.setRenderer(r.Name(), device, note)
 	logf("render loop started: %s %s %s", r.Name(), device, note)
@@ -239,15 +313,50 @@ func (c *card) render(sf *plugin.Surface) {
 			continue
 		}
 		if c.switchTo.Swap(false) {
-			want := "vulkan"
-			if r.Name() == "vulkan" {
-				want = "cpu"
-			}
+			mode = (mode + 1) % modes
+			zero.free()
+			zero, copyGen = nil, -1
 			r.Close()
-			r, device, note = open(want)
+			r, device, note = open(mode)
 			c.stats.setRenderer(r.Name(), device, note)
 		}
-		b, err := sf.Buffer(c.ctx)
+		ex, exports := r.(scene.Exporter)
+		if gen := sf.Info().Gen; mode == modeZeroCopy && exports && copyGen != gen && (zero == nil || zero.gen != gen) {
+			zero.free()
+			var why string
+			if zero, why = c.export(sf, ex); zero == nil {
+				if c.ctx.Err() != nil {
+					return
+				}
+				copyGen = gen
+				c.stats.setRenderer(r.Name(), device, why)
+				logf("zero-copy not used for generation %d: %s", gen, why)
+			} else {
+				c.stats.setRenderer(r.Name()+", zero-copy", device, "")
+				logf("zero-copy: %d images registered for generation %d", len(zero.targets), gen)
+			}
+		}
+		c.zeroCopy.Store(zero != nil)
+
+		var b *plugin.SurfaceBuffer
+		var err error
+		if zero != nil {
+			b, err = sf.AddedBuffer(c.ctx)
+			if errors.Is(err, plugin.ErrSurfaceBuffers) {
+				// the surface was resized: its images went with their generation. Register the
+				// new one's, once its plugin.surface is here.
+				zero.free()
+				zero = nil
+				select {
+				case <-c.ctx.Done():
+					return
+				case <-time.After(2 * time.Millisecond):
+				}
+				continue
+			}
+		} else {
+			b, err = sf.Buffer(c.ctx)
+		}
 		if err != nil {
 			if c.ctx.Err() == nil {
 				logf("render loop: no buffer: %v", err)
@@ -259,29 +368,43 @@ func (c *card) render(sf *plugin.Surface) {
 			sceneT += now.Sub(last)
 		}
 		last = now
-		bgra := b.Format == "bgra8"
 		start := time.Now()
-		if err := r.Draw(sceneT.Seconds(), b.Pix, b.W, b.H, b.Pitch, bgra); err != nil {
-			r.Close()
-			r, device, _ = open("cpu")
-			c.stats.setRenderer(r.Name(), device, "fell back to the CPU: "+err.Error())
-			logf("vulkan failed, on the CPU now: %v", err)
+		if zero != nil {
+			if err := zero.targets[b.ID].Render(sceneT.Seconds()); err != nil {
+				// the buffer is presented as it is, so its credit comes back; the next frames copy
+				copyGen = zero.gen
+				c.stats.setRenderer(r.Name(), device, "zero-copy gave up: "+err.Error())
+				logf("zero-copy gave up, copying now: %v", err)
+			}
+		} else {
+			bgra := b.Format == "bgra8"
 			if err := r.Draw(sceneT.Seconds(), b.Pix, b.W, b.H, b.Pitch, bgra); err != nil {
-				return
+				r.Close()
+				mode = modeCPU
+				r, device, _ = open(mode)
+				c.stats.setRenderer(r.Name(), device, "fell back to the CPU: "+err.Error())
+				logf("vulkan failed, on the CPU now: %v", err)
+				if err := r.Draw(sceneT.Seconds(), b.Pix, b.W, b.H, b.Pitch, bgra); err != nil {
+					return
+				}
+			}
+			c.mu.Lock()
+			c.format = b.Format
+			lines, history, info := c.lines, c.history, c.info
+			c.mu.Unlock()
+			if c.overlay.Load() {
+				drawOverlay(b, info.Scale, lines, history, paused, bgra)
 			}
 		}
 		c.stats.rendered(time.Since(start))
-		c.mu.Lock()
-		c.format = b.Format
-		lines, history, info := c.lines, c.history, c.info
-		c.mu.Unlock()
-		if c.overlay.Load() {
-			drawOverlay(b, info.Scale, lines, history, paused, bgra)
-		}
 		seq, err := sf.Present(b, image.Rectangle{}, 0)
 		if err != nil {
 			logf("render loop: present: %v", err)
 			return
+		}
+		if zero != nil && copyGen == zero.gen { // its render failed: this generation copies from here
+			zero.free()
+			zero = nil
 		}
 		c.stats.presented(seq, time.Now())
 		shownPaused = paused
@@ -333,6 +456,16 @@ func (c *card) measure(sf *plugin.Surface) {
 			c.mu.Lock()
 			c.lines, c.history = lines, history
 			c.mu.Unlock()
+			// A zero-copy frame is the GPU's image, which the plugin can't draw text over: the
+			// figures go to the card's title and, in full, to the plugin's log.
+			if zero := c.zeroCopy.Load(); zero {
+				c.peer.Title(c.stats.title())
+				fmt.Fprintln(os.Stderr, strings.Join(lines[:len(lines)-1], " | "))
+				c.titled = true
+			} else if c.titled {
+				c.peer.Title("Render test (3D)")
+				c.titled = false
+			}
 		}
 	}
 }

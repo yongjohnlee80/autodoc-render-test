@@ -5,11 +5,14 @@ resizable card that draws a 3D scene on a pixel surface (plugin protocol 10) and
 rate, frame times and memory as it runs.
 
 The scene is golib's `gui/examples/scene3d`: a textured, lit crate turning over a tiled floor. It
-is drawn by one of two renderers, switched with `r`:
+is drawn by one of three renderers, cycled with `r`:
 
-- **vulkan**: on the GPU, on a Vulkan device of its own, into device memory; the frame is copied
-  into a cached host buffer and from there into the card's shared-memory buffer. A plugin hands
-  AutoDoc shared memory, not GPU images, so the copy is part of the cost.
+- **vulkan, zero-copy**: on the GPU, on a Vulkan device of its own, into images it exports as
+  DMA-BUFs and registers with AutoDoc. The frame AutoDoc shows is the image the GPU drew: no
+  pixel crosses either CPU. It needs an AutoDoc whose window offers DMA-BUF frames and a driver
+  that exports a LINEAR one; otherwise the card says why and copies.
+- **vulkan** (copied): on the GPU, then read back into a cached host buffer and from there into
+  the card's shared-memory buffer. The copy is that path's cost, on both sides.
 - **cpu**: in Go, straight into the card's buffer, one band of rows per core.
 
 **Which is better?** At a 60 Hz display both keep up, so the shown frame rate and frame times are
@@ -37,7 +40,7 @@ https://github.com/yongjohnlee80/autodoc-render-test
 AutoDoc clones it and asks before anything runs. On **Yes, at my own risk** it builds the plugin
 and lists **Plugins › Render test (3D)**. A plugin runs as you.
 
-The build needs Go 1.26.9 or newer, a C compiler and the Vulkan headers and loader
+The build needs Go 1.26.11 or newer, a C compiler and the Vulkan headers and loader
 (`vulkan-headers` and `vulkan-icd-loader` on Arch, `libvulkan-dev` on Debian and Ubuntu), since
 the Vulkan renderer is cgo. Pixel surfaces are Linux's today; elsewhere the card shows a line of
 text.
@@ -50,13 +53,17 @@ shows a line saying to open it in the GUI.
 
 | Key | |
 |---|---|
-| r | switch the renderer: vulkan ↔ cpu |
+| r | the next renderer: vulkan zero-copy → vulkan copied → cpu |
 | u | paced (the default: the next frame once AutoDoc showed the last) ↔ unpaced (as fast as AutoDoc credits buffers: a stress test, most frames superseded) |
 | space | pause and resume rendering, to watch AutoDoc idle |
 | o | hide or show the overlay |
 | Esc | close the card (the plugin keeps running) |
 
 ## What the overlay shows
+
+A zero-copy frame is the GPU's own image, which the plugin can't draw text over. In that mode the
+card's title carries the second's figures (the frame rate, AutoDoc's CPU and the plugin's), and
+the full lines go to the plugin's log, one line a second. Press `r` for the overlay again.
 
 Updated once a second; the graph is the latest 180 frames shown.
 

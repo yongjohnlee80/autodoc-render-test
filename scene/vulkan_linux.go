@@ -26,9 +26,9 @@ var (
 	fragSPV []byte
 )
 
-// Vulkan renders the scene on the GPU, on a VkDevice of its own, and reads each frame back into
-// the caller's buffer: a plugin hands AutoDoc shared memory, not GPU images, so the copy is the
-// price of drawing on the GPU here.
+// Vulkan renders the scene on the GPU, on a VkDevice of its own. Draw reads the frame back into
+// the caller's buffer (AutoDoc's shared memory): the copy is the price of that path. NewTarget
+// makes an image the device exports as a DMA-BUF instead, which AutoDoc shows with no copy.
 type Vulkan struct {
 	s      *C.s3d
 	device string
@@ -97,4 +97,65 @@ func (v *Vulkan) Close() {
 	C.s3d_target_free(v.s, v.target)
 	C.s3d_free(v.s)
 	v.target, v.s = nil, nil
+}
+
+// vkTarget is an image the device renders into and exports.
+type vkTarget struct {
+	v     *Vulkan
+	t     *C.s3d_target
+	w, h  int
+	fd    int
+	pitch int
+}
+
+// NewTarget makes a w by h image exported as a LINEAR, one-plane DMA-BUF starting at its first
+// byte; an error when the device exports none such.
+func (v *Vulkan) NewTarget(w, h int, bgra bool) (Target, error) {
+	var errBuf [256]C.char
+	format := C.int(C.S3D_RGBA8)
+	if bgra {
+		format = C.int(C.S3D_BGRA8)
+	}
+	var mods [64]C.uint64_t
+	n := int(C.s3d_modifiers(v.s, format, &mods[0], C.int(len(mods))))
+	linear := false
+	for _, m := range mods[:n] {
+		linear = linear || m == 0
+	}
+	if !linear {
+		return nil, fmt.Errorf("vulkan: %s exports no LINEAR DMA-BUF it can render to (%d other modifiers)", v.device, n)
+	}
+	var tg *C.s3d_target
+	var ex C.s3d_export
+	only := C.uint64_t(0) // DRM_FORMAT_MOD_LINEAR
+	if C.s3d_target_new(v.s, C.int(w), C.int(h), format, &only, 1, &tg, &ex, &errBuf[0], C.int(len(errBuf))) != 0 {
+		C.s3d_target_free(v.s, tg)
+		return nil, fmt.Errorf("vulkan exported target: %s", C.GoString(&errBuf[0]))
+	}
+	if ex.offset != 0 || ex.modifier != 0 {
+		C.s3d_target_free(v.s, tg)
+		return nil, fmt.Errorf("vulkan exported target: offset %d, modifier %#x; want a LINEAR plane at 0", uint32(ex.offset), uint64(ex.modifier))
+	}
+	return &vkTarget{v: v, t: tg, w: w, h: h, fd: int(ex.fd), pitch: int(ex.pitch)}, nil
+}
+
+func (t *vkTarget) FD() int    { return t.fd }
+func (t *vkTarget) Pitch() int { return t.pitch }
+
+// Render draws the scene at time t into the image and waits for it.
+func (t *vkTarget) Render(at float64) error {
+	var errBuf [256]C.char
+	draws := drawsAt(at, imagePt(t.w, t.h))
+	if C.s3d_render(t.v.s, t.t, (*C.float)(unsafe.Pointer(&draws[0])), &errBuf[0], C.int(len(errBuf))) != 0 {
+		return fmt.Errorf("vulkan render: %s", C.GoString(&errBuf[0]))
+	}
+	return nil
+}
+
+// Free frees the image and closes its DMA-BUF. Free every target before the renderer's Close.
+func (t *vkTarget) Free() {
+	if t.t != nil {
+		C.s3d_target_free(t.v.s, t.t)
+		t.t = nil
+	}
 }
