@@ -205,18 +205,57 @@ const (
 	modes
 )
 
-// open is the renderer for mode: Vulkan when a device takes it, else the CPU. The note says why
-// a Vulkan request fell back.
-func open(mode int) (r scene.Renderer, device, note string) {
-	if mode != modeCPU {
-		v, err := scene.NewVulkan()
-		if err == nil {
-			return v, v.Device(), ""
-		}
-		note = err.Error()
-	}
-	return scene.NewCPU(), "", note
+// renderers are the loop's two renderers. The Vulkan device is opened once and kept while r
+// cycles, the CPU renderer's turn included: AutoDoc counts a size's three registered images until
+// the card is resized, so closing the device at each switch would leave zero-copy nothing to
+// register when r came round to it. An idle device costs the CPU figures nothing.
+type renderers struct {
+	vk     *scene.Vulkan
+	vkNote string // why there is no Vulkan device
+	cpu    scene.Renderer
 }
+
+// pick is the renderer for mode: Vulkan when a device takes it (tried again at each switch while
+// there is none), else the CPU, with a note saying why a Vulkan request fell back.
+func (rs *renderers) pick(mode int) (r scene.Renderer, device, note string) {
+	if mode != modeCPU {
+		if rs.vk == nil {
+			v, err := newVulkan()
+			if err != nil {
+				rs.vkNote = err.Error()
+			} else {
+				rs.vk, rs.vkNote = v, ""
+			}
+		}
+		if rs.vk != nil {
+			return rs.vk, rs.vk.Device(), ""
+		}
+		note = rs.vkNote
+	}
+	if rs.cpu == nil {
+		rs.cpu = scene.NewCPU()
+	}
+	return rs.cpu, "", note
+}
+
+// dropVulkan closes a device that failed, its images first.
+func (rs *renderers) dropVulkan(z *zeroCopy) {
+	z.leaveDevice()
+	if rs.vk != nil {
+		rs.vk.Close()
+		rs.vk = nil
+	}
+}
+
+func (rs *renderers) close(z *zeroCopy) {
+	rs.dropVulkan(z)
+	if rs.cpu != nil {
+		rs.cpu.Close()
+	}
+}
+
+// newVulkan opens the device: a variable so a cell counts the opens.
+var newVulkan = scene.NewVulkan
 
 // exported is a generation's images, registered with AutoDoc: each by the id AutoDoc knows it by.
 type exported struct {
@@ -312,8 +351,9 @@ func (c *card) zeroFor(sf *plugin.Surface, r scene.Renderer, z *zeroCopy) (bool,
 	return true, ""
 }
 
-// leaveDevice is the Vulkan device about to close: its images go with it. AutoDoc still counts
-// their registrations, so this generation can register no more.
+// leaveDevice is the Vulkan device about to close, after a failure: its images go with it. AutoDoc
+// still counts their registrations, so this generation can register no more, on a device opened
+// again or not.
 func (z *zeroCopy) leaveDevice() {
 	if z.imgs == nil {
 		return
@@ -336,12 +376,12 @@ const usedUp = "this size's three images are used up: resize the card to registe
 // frame saying so, then waits.
 func (c *card) render(sf *plugin.Surface) {
 	mode := modeZeroCopy
-	r, device, note := open(mode)
+	var rs renderers
 	var z zeroCopy
+	r, device, note := rs.pick(mode)
 	defer func() {
-		z.leaveDevice()
-		r.Close()
-		logf("render loop ended; %s renderer and its images freed", r.Name())
+		rs.close(&z)
+		logf("render loop ended; the renderers and their images freed")
 	}()
 	c.stats.setRenderer(r.Name(), device, note)
 	logf("render loop started: %s %s %s", r.Name(), device, note)
@@ -369,16 +409,8 @@ func (c *card) render(sf *plugin.Surface) {
 			continue
 		}
 		if c.switchTo.Swap(false) {
-			// Zero-copy and copied are the one Vulkan device: switching between them keeps the
-			// device and the generation's registered images, so r goes back and forth without
-			// registering again. The CPU closes the device, and its images with it.
-			from := mode
 			mode = (mode + 1) % modes
-			if from == modeCopied || mode == modeZeroCopy {
-				z.leaveDevice()
-				r.Close()
-				r, device, note = open(mode)
-			}
+			r, device, note = rs.pick(mode)
 			z.said = false
 			c.stats.setRenderer(r.Name(), device, note)
 		}
@@ -440,10 +472,9 @@ func (c *card) render(sf *plugin.Surface) {
 		} else {
 			bgra := b.Format == "bgra8"
 			if err := r.Draw(sceneT.Seconds(), b.Pix, b.W, b.H, b.Pitch, bgra); err != nil {
-				z.leaveDevice()
-				r.Close()
+				rs.dropVulkan(&z)
 				mode = modeCPU
-				r, device, _ = open(mode)
+				r, device, _ = rs.pick(mode)
 				c.stats.setRenderer(r.Name(), device, "fell back to the CPU: "+err.Error())
 				logf("vulkan failed, on the CPU now: %v", err)
 				if err := r.Draw(sceneT.Seconds(), b.Pix, b.W, b.H, b.Pitch, bgra); err != nil {

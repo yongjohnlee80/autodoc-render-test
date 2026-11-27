@@ -203,8 +203,8 @@ func TestTheTitleCarriesTheSecondsFigures(t *testing.T) {
 	}
 }
 
-// r between zero-copy and copied keeps the Vulkan device, so the generation's images are
-// registered once: coming back to zero-copy finds them, and sends AutoDoc nothing more. (AutoDoc
+// r keeps the Vulkan device through every mode, so the generation's images are registered once:
+// coming round to zero-copy finds them, and sends AutoDoc nothing more. (AutoDoc
 // counts three registrations a generation and none can be taken back, so a second round would be
 // refused.)
 func TestZeroCopyAndBackRegistersOnce(t *testing.T) {
@@ -214,7 +214,7 @@ func TestZeroCopyAndBackRegistersOnce(t *testing.T) {
 	if use, why := c.zeroFor(sf, ex, &z); !use {
 		t.Fatalf("zero-copy not taken: %s", why)
 	}
-	// copied mode draws through the same device and asks zeroFor nothing; then r comes back
+	// copied and CPU ask zeroFor nothing; then r comes round to zero-copy again
 	for range 3 {
 		if use, why := c.zeroFor(sf, ex, &z); !use {
 			t.Fatalf("back in zero-copy, it was not taken: %s", why)
@@ -225,8 +225,8 @@ func TestZeroCopyAndBackRegistersOnce(t *testing.T) {
 	}
 }
 
-// After the CPU renderer the Vulkan device is gone and its images with it, while AutoDoc still
-// counts their registrations: zero-copy can't register again at this size. The card says that in
+// After the Vulkan device failed it is closed and its images with it, while AutoDoc still counts
+// their registrations: zero-copy can't register again at this size, on a device opened again. The card says that in
 // its own words, naming the resize, and sends AutoDoc nothing; a resize registers again.
 func TestAfterTheDeviceWentZeroCopySaysToResize(t *testing.T) {
 	c, sf, adds := hosted(t, bothKinds, true)
@@ -235,13 +235,13 @@ func TestAfterTheDeviceWentZeroCopySaysToResize(t *testing.T) {
 	if use, why := c.zeroFor(sf, ex, &z); !use {
 		t.Fatalf("zero-copy not taken: %s", why)
 	}
-	z.leaveDevice() // r reached the CPU renderer
+	z.leaveDevice() // the device failed and was closed
 	if ex.freed != 3 {
 		t.Fatalf("leaving the device freed %d of its three images", ex.freed)
 	}
 	use, why := c.zeroFor(sf, ex, &z)
 	if use || !strings.Contains(why, "used up") || !strings.Contains(why, "resize the card") {
-		t.Fatalf("back from the CPU at the same size: use %v, %q; want it to copy and name the resize", use, why)
+		t.Fatalf("on a new device at the same size: use %v, %q; want it to copy and name the resize", use, why)
 	}
 	if n := len(adds()); n != 3 || ex.made != 3 {
 		t.Fatalf("%d registrations, %d images made; want no more than the first three", n, ex.made)
@@ -249,5 +249,27 @@ func TestAfterTheDeviceWentZeroCopySaysToResize(t *testing.T) {
 	z.leaveDevice() // with no images: nothing to free, and the note stands
 	if _, why := c.zeroFor(sf, ex, &z); !strings.Contains(why, "resize the card") {
 		t.Errorf("asked again: %q", why)
+	}
+}
+
+// The Vulkan device is opened once while r cycles through every mode, the CPU's included; and a
+// device that failed is opened again only at the next switch.
+func TestRKeepsTheVulkanDeviceThroughEveryMode(t *testing.T) {
+	opens := 0
+	newVulkan = func() (*scene.Vulkan, error) { opens++; return &scene.Vulkan{}, nil }
+	t.Cleanup(func() { newVulkan = scene.NewVulkan })
+	var rs renderers
+	names := ""
+	for i := range 2 * modes {
+		r, _, _ := rs.pick(i % modes)
+		names += r.Name() + " "
+	}
+	if opens != 1 || names != "vulkan vulkan cpu vulkan vulkan cpu " {
+		t.Fatalf("%d device opens over two rounds of r, renderers %q; want one open, and vulkan vulkan cpu each round", opens, names)
+	}
+	newVulkan = func() (*scene.Vulkan, error) { opens++; return nil, errors.New("no device") }
+	rs.vk = nil // as dropVulkan leaves it
+	if r, _, note := rs.pick(modeCopied); r.Name() != "cpu" || note != "no device" || opens != 2 {
+		t.Fatalf("with no device: %s, %q, %d opens; want the CPU, the reason, one more try", r.Name(), note, opens)
 	}
 }

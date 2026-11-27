@@ -65,10 +65,10 @@ A zero-copy frame is the GPU's own image, which the plugin can't draw text over.
 card's title carries the second's figures (the frame rate, AutoDoc's CPU and the plugin's), and
 the full lines go to the plugin's log, one line a second. Press `r` for the overlay again.
 
-Zero-copy and copied are the same Vulkan device, so `r` goes between them freely. The CPU renderer
-closes the device. AutoDoc takes three images for each size of the card and none can be taken
-back, so coming round to zero-copy after the CPU at the same size copies instead, with a note:
-resize the card a little and zero-copy registers again.
+The Vulkan device stays open while `r` cycles, the CPU renderer's turn included, so zero-copy
+comes back each round with the images it registered. AutoDoc takes three images for each size of
+the card and none can be taken back; if the device fails and is opened again, zero-copy at the
+same size copies instead, with a note: resize the card a little and it registers again.
 
 Updated once a second; the graph is the latest 180 frames shown.
 
