@@ -53,7 +53,7 @@ shows a line saying to open it in the GUI.
 
 | Key | |
 |---|---|
-| r | the next renderer: vulkan zero-copy → vulkan copied → cpu |
+| r | the next renderer: vulkan zero-copy → vulkan copied → cpu → zero-copy again |
 | u | paced (the default: the next frame once AutoDoc showed the last) ↔ unpaced (as fast as AutoDoc credits buffers: a stress test, most frames superseded) |
 | space | pause and resume rendering, to watch AutoDoc idle |
 | o | hide or show the overlay |
@@ -64,6 +64,11 @@ shows a line saying to open it in the GUI.
 A zero-copy frame is the GPU's own image, which the plugin can't draw text over. In that mode the
 card's title carries the second's figures (the frame rate, AutoDoc's CPU and the plugin's), and
 the full lines go to the plugin's log, one line a second. Press `r` for the overlay again.
+
+Zero-copy and copied are the same Vulkan device, so `r` goes between them freely. The CPU renderer
+closes the device. AutoDoc takes three images for each size of the card and none can be taken
+back, so coming round to zero-copy after the CPU at the same size copies instead, with a note:
+resize the card a little and zero-copy registers again.
 
 Updated once a second; the graph is the latest 180 frames shown.
 

@@ -274,16 +274,72 @@ func (c *card) export(sf *plugin.Surface, ex scene.Exporter) (*exported, string)
 	return e, ""
 }
 
+// zeroCopy is the render loop's zero-copy state. AutoDoc counts a generation's registrations until
+// the generation ends, and there is no taking one back: so a generation's images are registered
+// once, kept while the Vulkan device lives, and can't be registered again in the same generation
+// once the device has gone.
+type zeroCopy struct {
+	imgs    *exported // the generation's registered images
+	copyGen int       // the generation that copies instead, and why
+	why     string
+	said    bool // the loop has said which path this mode took
+}
+
+// zeroFor says whether this frame is one of the registered images, registering the generation's
+// when it has none yet; and why not, when it isn't.
+func (c *card) zeroFor(sf *plugin.Surface, r scene.Renderer, z *zeroCopy) (bool, string) {
+	gen := sf.Info().Gen
+	if z.imgs != nil && z.imgs.gen != gen { // a resize: AutoDoc dropped them with their generation
+		z.imgs.free()
+		z.imgs, z.said = nil, false
+	}
+	if z.why != "" && z.copyGen == gen {
+		return false, z.why
+	}
+	if z.imgs != nil {
+		return true, ""
+	}
+	ex, ok := r.(scene.Exporter)
+	if !ok {
+		return false, "" // the CPU renderer, after Vulkan failed: its own note stands
+	}
+	e, why := c.export(sf, ex)
+	if e == nil {
+		z.copyGen, z.why = gen, why
+		return false, why
+	}
+	z.imgs, z.said = e, false
+	return true, ""
+}
+
+// leaveDevice is the Vulkan device about to close: its images go with it. AutoDoc still counts
+// their registrations, so this generation can register no more.
+func (z *zeroCopy) leaveDevice() {
+	if z.imgs == nil {
+		return
+	}
+	z.copyGen, z.why = z.imgs.gen, usedUp
+	z.imgs.free()
+	z.imgs = nil
+}
+
+// failed is an image that wouldn't render: the generation copies from here.
+func (z *zeroCopy) failed(err error) {
+	z.copyGen, z.why, z.said = z.imgs.gen, "zero-copy gave up: "+err.Error()+": copying", false
+	logf("zero-copy gave up, copying now: %v", err)
+}
+
+const usedUp = "this size's three images are used up: resize the card to register again"
+
 // render draws a frame into each buffer the host credits, as fast as it credits them: one frame
 // in flight per buffer, so the rate it reaches is what AutoDoc draws. Paused, it draws one last
 // frame saying so, then waits.
 func (c *card) render(sf *plugin.Surface) {
 	mode := modeZeroCopy
 	r, device, note := open(mode)
-	var zero *exported // the generation's registered images, in zero-copy mode
-	copyGen := -1      // the generation zero-copy was given up for: retried at the next
+	var z zeroCopy
 	defer func() {
-		zero.free()
+		z.leaveDevice()
 		r.Close()
 		logf("render loop ended; %s renderer and its images freed", r.Name())
 	}()
@@ -313,40 +369,45 @@ func (c *card) render(sf *plugin.Surface) {
 			continue
 		}
 		if c.switchTo.Swap(false) {
+			// Zero-copy and copied are the one Vulkan device: switching between them keeps the
+			// device and the generation's registered images, so r goes back and forth without
+			// registering again. The CPU closes the device, and its images with it.
+			from := mode
 			mode = (mode + 1) % modes
-			zero.free()
-			zero, copyGen = nil, -1
-			r.Close()
-			r, device, note = open(mode)
+			if from == modeCopied || mode == modeZeroCopy {
+				z.leaveDevice()
+				r.Close()
+				r, device, note = open(mode)
+			}
+			z.said = false
 			c.stats.setRenderer(r.Name(), device, note)
 		}
-		ex, exports := r.(scene.Exporter)
-		if gen := sf.Info().Gen; mode == modeZeroCopy && exports && copyGen != gen && (zero == nil || zero.gen != gen) {
-			zero.free()
+		use := false
+		if mode == modeZeroCopy {
 			var why string
-			if zero, why = c.export(sf, ex); zero == nil {
-				if c.ctx.Err() != nil {
-					return
+			if use, why = c.zeroFor(sf, r, &z); c.ctx.Err() != nil {
+				return
+			}
+			if !z.said {
+				z.said = true
+				if use {
+					c.stats.setRenderer(r.Name()+", zero-copy", device, "")
+					logf("zero-copy: %d images registered for generation %d", len(z.imgs.targets), z.imgs.gen)
+				} else {
+					c.stats.setRenderer(r.Name(), device, why)
+					logf("zero-copy not used: %s", why)
 				}
-				copyGen = gen
-				c.stats.setRenderer(r.Name(), device, why)
-				logf("zero-copy not used for generation %d: %s", gen, why)
-			} else {
-				c.stats.setRenderer(r.Name()+", zero-copy", device, "")
-				logf("zero-copy: %d images registered for generation %d", len(zero.targets), gen)
 			}
 		}
-		c.zeroCopy.Store(zero != nil)
+		c.zeroCopy.Store(use)
 
 		var b *plugin.SurfaceBuffer
 		var err error
-		if zero != nil {
+		if use {
 			b, err = sf.AddedBuffer(c.ctx)
 			if errors.Is(err, plugin.ErrSurfaceBuffers) {
-				// the surface was resized: its images went with their generation. Register the
-				// new one's, once its plugin.surface is here.
-				zero.free()
-				zero = nil
+				// the surface was resized: its images went with their generation. zeroFor
+				// registers the new one's, once its plugin.surface is here.
 				select {
 				case <-c.ctx.Done():
 					return
@@ -369,16 +430,17 @@ func (c *card) render(sf *plugin.Surface) {
 		}
 		last = now
 		start := time.Now()
-		if zero != nil {
-			if err := zero.targets[b.ID].Render(sceneT.Seconds()); err != nil {
-				// the buffer is presented as it is, so its credit comes back; the next frames copy
-				copyGen = zero.gen
-				c.stats.setRenderer(r.Name(), device, "zero-copy gave up: "+err.Error())
-				logf("zero-copy gave up, copying now: %v", err)
+		if use {
+			if err := z.imgs.targets[b.ID].Render(sceneT.Seconds()); err != nil {
+				// The buffer is still presented, with whatever its image holds (the last frame
+				// drawn into it, or nothing): presenting is what brings its credit back. A stale
+				// frame for one refresh is acceptable on a test card. The next frames copy.
+				z.failed(err)
 			}
 		} else {
 			bgra := b.Format == "bgra8"
 			if err := r.Draw(sceneT.Seconds(), b.Pix, b.W, b.H, b.Pitch, bgra); err != nil {
+				z.leaveDevice()
 				r.Close()
 				mode = modeCPU
 				r, device, _ = open(mode)
@@ -401,10 +463,6 @@ func (c *card) render(sf *plugin.Surface) {
 		if err != nil {
 			logf("render loop: present: %v", err)
 			return
-		}
-		if zero != nil && copyGen == zero.gen { // its render failed: this generation copies from here
-			zero.free()
-			zero = nil
 		}
 		c.stats.presented(seq, time.Now())
 		shownPaused = paused

@@ -202,3 +202,52 @@ func TestTheTitleCarriesTheSecondsFigures(t *testing.T) {
 		t.Errorf("title %q, want %q", got, want)
 	}
 }
+
+// r between zero-copy and copied keeps the Vulkan device, so the generation's images are
+// registered once: coming back to zero-copy finds them, and sends AutoDoc nothing more. (AutoDoc
+// counts three registrations a generation and none can be taken back, so a second round would be
+// refused.)
+func TestZeroCopyAndBackRegistersOnce(t *testing.T) {
+	c, sf, adds := hosted(t, bothKinds, true)
+	ex := &fakeExporter{}
+	var z zeroCopy
+	if use, why := c.zeroFor(sf, ex, &z); !use {
+		t.Fatalf("zero-copy not taken: %s", why)
+	}
+	// copied mode draws through the same device and asks zeroFor nothing; then r comes back
+	for range 3 {
+		if use, why := c.zeroFor(sf, ex, &z); !use {
+			t.Fatalf("back in zero-copy, it was not taken: %s", why)
+		}
+	}
+	if n := len(adds()); n != 3 || ex.made != 3 || ex.freed != 0 {
+		t.Fatalf("%d registrations, %d images made, %d freed; want the three, once, all kept", n, ex.made, ex.freed)
+	}
+}
+
+// After the CPU renderer the Vulkan device is gone and its images with it, while AutoDoc still
+// counts their registrations: zero-copy can't register again at this size. The card says that in
+// its own words, naming the resize, and sends AutoDoc nothing; a resize registers again.
+func TestAfterTheDeviceWentZeroCopySaysToResize(t *testing.T) {
+	c, sf, adds := hosted(t, bothKinds, true)
+	ex := &fakeExporter{}
+	var z zeroCopy
+	if use, why := c.zeroFor(sf, ex, &z); !use {
+		t.Fatalf("zero-copy not taken: %s", why)
+	}
+	z.leaveDevice() // r reached the CPU renderer
+	if ex.freed != 3 {
+		t.Fatalf("leaving the device freed %d of its three images", ex.freed)
+	}
+	use, why := c.zeroFor(sf, ex, &z)
+	if use || !strings.Contains(why, "used up") || !strings.Contains(why, "resize the card") {
+		t.Fatalf("back from the CPU at the same size: use %v, %q; want it to copy and name the resize", use, why)
+	}
+	if n := len(adds()); n != 3 || ex.made != 3 {
+		t.Fatalf("%d registrations, %d images made; want no more than the first three", n, ex.made)
+	}
+	z.leaveDevice() // with no images: nothing to free, and the note stands
+	if _, why := c.zeroFor(sf, ex, &z); !strings.Contains(why, "resize the card") {
+		t.Errorf("asked again: %q", why)
+	}
+}
