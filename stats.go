@@ -38,10 +38,13 @@ type stats struct {
 	lastCPU    uint64    // the host's utime+stime, in clock ticks, at the last second
 	lastSelf   uint64    // the plugin's own, likewise
 	lastSecond time.Time
+	shown      int     // frames AutoDoc drew, the latest second
+	hostCPU    float64 // AutoDoc's CPU, percent of a core, the latest second; -1 unknown
+	selfCPU    float64 // the plugin's own, likewise
 }
 
 func newStats(hostPID int) *stats {
-	return &stats{hostPID: hostPID, presentAt: map[uint64]int64{}, outcomes: map[string]int{}}
+	return &stats{hostPID: hostPID, presentAt: map[uint64]int64{}, outcomes: map[string]int{}, hostCPU: -1, selfCPU: -1}
 }
 
 func (s *stats) setRenderer(name, device, note string) {
@@ -104,6 +107,7 @@ func (s *stats) second(info plugin.SurfaceInfo, format string, paced bool) ([]st
 	renderer, device, note := s.renderer, s.device, s.note
 	history := slices.Clone(s.history)
 	s.renders, s.latency, s.interval, s.outcomes = nil, nil, nil, map[string]int{}
+	s.shown = outcomes["drawn"]
 	now := time.Now()
 	elapsed := now.Sub(s.lastSecond).Seconds()
 	s.lastSecond = now
@@ -144,7 +148,8 @@ func (s *stats) hostLine(elapsed float64) string {
 	if ticks, ok := procCPU(s.hostPID); ok {
 		s.mu.Lock()
 		if s.lastCPU != 0 && elapsed > 0 {
-			cpu = fmt.Sprintf("   CPU %.0f%%", float64(ticks-s.lastCPU)/clockTicks/elapsed*100)
+			s.hostCPU = float64(ticks-s.lastCPU) / clockTicks / elapsed * 100
+			cpu = fmt.Sprintf("   CPU %.0f%%", s.hostCPU)
 		}
 		s.lastCPU = ticks
 		s.mu.Unlock()
@@ -168,12 +173,28 @@ func (s *stats) selfLine(elapsed float64) string {
 	if ticks, ok := procCPU(os.Getpid()); ok {
 		s.mu.Lock()
 		if s.lastSelf != 0 && elapsed > 0 {
-			cpu = fmt.Sprintf("CPU %.0f%%   ", float64(ticks-s.lastSelf)/clockTicks/elapsed*100)
+			s.selfCPU = float64(ticks-s.lastSelf) / clockTicks / elapsed * 100
+			cpu = fmt.Sprintf("CPU %.0f%%   ", s.selfCPU)
 		}
 		s.lastSelf = ticks
 		s.mu.Unlock()
 	}
 	return fmt.Sprintf("plugin: %sRSS %s   Go heap %.1f MB   GC %d", cpu, kb(st["VmRSS"]), float64(heap)/(1<<20), gcs)
+}
+
+// title is the latest second in a line short enough for the card's title: what is shown where
+// nothing can be drawn over the frame.
+func (s *stats) title() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t := fmt.Sprintf("Render test: %s, %d fps", s.renderer, s.shown)
+	if s.hostCPU >= 0 {
+		t += fmt.Sprintf(", AutoDoc CPU %.0f%%", s.hostCPU)
+	}
+	if s.selfCPU >= 0 {
+		t += fmt.Sprintf(", plugin CPU %.0f%%", s.selfCPU)
+	}
+	return t
 }
 
 // clockTicks is USER_HZ, 100 on Linux.
