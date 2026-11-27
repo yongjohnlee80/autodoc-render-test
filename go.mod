@@ -3,7 +3,7 @@ module github.com/yongjohnlee80/autodoc-render-test
 go 1.26.11
 
 require (
-	github.com/yongjohnlee80/autodoc v0.3.18-0.20261126225953-176b520d1e90
+	github.com/yongjohnlee80/autodoc v0.3.18-0.20261126234011-08ee080b32f8
 	golang.org/x/image v0.45.0
 )
 

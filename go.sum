@@ -1,5 +1,5 @@
-github.com/yongjohnlee80/autodoc v0.3.18-0.20261126225953-176b520d1e90 h1:/DcFZx4LUlFJ1o0VQI4poR+gEiBnMXY4c9W49WghgsM=
-github.com/yongjohnlee80/autodoc v0.3.18-0.20261126225953-176b520d1e90/go.mod h1:6OQXo29x9JiCf0KswWXvTkqkTHfGhUkkLnGKZcEkJHA=
+github.com/yongjohnlee80/autodoc v0.3.18-0.20261126234011-08ee080b32f8 h1:HeFCb8vzbquNJH+JFSko5fcvrofg5KExLQwOEc+Rt9A=
+github.com/yongjohnlee80/autodoc v0.3.18-0.20261126234011-08ee080b32f8/go.mod h1:6OQXo29x9JiCf0KswWXvTkqkTHfGhUkkLnGKZcEkJHA=
 github.com/yongjohnlee80/golib v0.8.65 h1:aUPkIcB8OS+UbNrNKy/bbsmkuJ7yXAZG30aPC9bDQGw=
 github.com/yongjohnlee80/golib v0.8.65/go.mod h1:iBoX77xVN23og0XTvPyE2UtqF26fF5Ohtd5AxsgF3j0=
 golang.org/x/image v0.45.0 h1:FMb1nTbH5H9vF55SriQHgFw5GnNL9Jg6L25BwXKzhB0=
